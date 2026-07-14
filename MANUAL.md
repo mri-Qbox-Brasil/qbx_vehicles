@@ -1,240 +1,255 @@
-# Manual do qbx_vehicles
+# qbx_vehicles — Manual
 
-API de gerenciamento de veículos do jogador para Qbox — recurso servidor que fornece API abrangente para gerenciar veículos próprios com persistência em banco de dados.
+Camada de acesso à tabela `player_vehicles`: um recurso server-only, sem UI e sem comandos, que expõe exports de CRUD de veículos de jogador para os demais recursos do Qbox (garagens, concessionárias, depósito).
 
-## Funcionalidades Principais
+---
 
-### Gerenciamento de Veículos
-- **Criação**: Criar novos veículos com geração automática de placa
-- **Pesquisa**: Obter veículos por ID, citizen ID, licença ou placa
-- **Transferência**: Alterar propriedade entre jogadores
-- **Exclusão**: Deletar veículos por múltiplos critérios
-- **Salvamento**: Salvar estado, props, garagem e danos
+## Sumário
 
-### Controle de Estado
-- **OUT**: Veículo fora da garagem (em uso)
-- **GARAGED**: Veículo na garagem
-- **IMPOUNDED**: Veículo apreendido
+1. [Dependências](#dependências)
+2. [Instalação](#instalação)
+3. [Banco de dados](#banco-de-dados)
+4. [Estados do veículo](#estados-do-veículo)
+5. [Entrypoints para outros recursos](#entrypoints-para-outros-recursos)
+6. [Event hooks](#event-hooks)
+7. [Eventos emitidos](#eventos-emitidos)
+8. [Estrutura de arquivos](#estrutura-de-arquivos)
 
-### Recursos Avançados
-- **Preços de Depósito**: Definir preços personalizados para veículos apreendidos
-- **Hooks**: Sistema de eventos para criar, salvar e alterar propriedade
-- **Validação de Placa**: Garante placas exclusivas automaticamente
+---
 
-## Configuração
+## Dependências
 
-Este é um recurso apenas do servidor (sem scripts do cliente). A configuração é feita via API e banco de dados.
+| Recurso | Obrigatório | Observação |
+|---|---|---|
+| `qbx_core` | Sim | Versão mínima **1.2.0**, validada em runtime por `lib.checkDependency`. Fornece `qbx.generateRandomPlate`, `qbx.string.trim` e o módulo de hooks |
+| `ox_lib` | Sim | `lib.checkDependency`, `lib.versionCheck`, `lib.print.debug` |
+| `oxmysql` | Sim | Todo o recurso é acesso à tabela `player_vehicles` |
 
-### Esquema do Banco de Dados
+O recurso é declarado `server_only 'yes'` — não carrega nada no client.
 
-Tabela `player_vehicles`:
+---
+
+## Instalação
+
+1. Copie a pasta `qbx_vehicles` para `resources/`.
+2. Importe o `vehicles.sql` no banco. Ele cria a tabela `player_vehicles` com chaves estrangeiras para `players`, então o SQL do `qbx_core` precisa ter rodado antes.
+3. Adicione ao `server.cfg`, **antes** dos recursos que dependem dele (garagens, `qbx_vehicleshop`):
+   ```
+   ensure qbx_vehicles
+   ```
+4. **Conflitos** — não rode junto com outro recurso que gerencie a tabela `player_vehicles` por conta própria. Recursos legados que fazem `INSERT`/`UPDATE` direto na tabela continuam funcionando, mas escapam dos event hooks descritos abaixo.
+
+No boot, o recurso valida a versão do `qbx_core` e consulta o repositório (`lib.versionCheck`) para avisar sobre releases mais novas.
+
+---
+
+## Banco de dados
+
+Tabela `player_vehicles`, criada por `vehicles.sql`:
 
 | Coluna | Tipo | Descrição |
-|--------|------|-------------|
-| `id` | INT (PK) | ID do veículo |
-| `citizenid` | VARCHAR | ID do cidadao do proprietário |
-| `license` | VARCHAR | Licença do proprietário |
-| `vehicle` | VARCHAR | Nome do modelo |
-| `hash` | BIGINT | Hash do modelo |
-| `mods` | JSON | Propriedades do veículo |
-| `plate` | VARCHAR | Placa de licença |
-| `state` | INT | Estado (0=OUT, 1=GARAGED, 2=IMPOUNDED) |
-| `garage` | VARCHAR | Garagem atual |
-| `depotprice` | INT | Preço de apreensão |
-| `fuel` | FLOAT | Nível de combustível |
-| `engine` | FLOAT | Saúde do motor |
-| `body` | FLOAT | Saúde da carroceria |
+|---|---|---|
+| `id` | int, PK, auto | Identificador do veículo. É o `vehicleId` usado por todos os exports |
+| `license` | varchar(50) | Licença do dono. Preenchida automaticamente a partir do `citizenid`. FK para `players` |
+| `citizenid` | varchar(50) | Dono do veículo. FK para `players`, com `ON DELETE CASCADE` |
+| `vehicle` | varchar(50) | Nome do modelo (spawn name) |
+| `hash` | varchar(50) | Hash `joaat` do modelo |
+| `mods` | longtext | Tabela de propriedades do `ox_lib` serializada em JSON. É a fonte da verdade das props |
+| `plate` | varchar(15), único | Placa |
+| `garage` | varchar(50) | Garagem onde o veículo está guardado |
+| `fuel` | int | Espelho de `props.fuelLevel` |
+| `engine` | float | Espelho de `props.engineHealth` |
+| `body` | float | Espelho de `props.bodyHealth` |
+| `state` | int | Estado do veículo. Ver a tabela abaixo |
+| `depotprice` | int | Valor a pagar para retirar o veículo do depósito |
+| `fakeplate` | varchar(50) | Coluna legada. O `qbx_vehicles` não lê nem escreve nela |
+| `drivingdistance` | int | Coluna legada. O `qbx_vehicles` não lê nem escreve nela |
+| `status` | text | Coluna legada. O `qbx_vehicles` não lê nem escreve nela |
 
-## Exports (API)
+As colunas espelho `fuel`, `engine` e `body` só são atualizadas por `SaveVehicle` quando o campo correspondente existe em `props`. Elas existem para compatibilidade com recursos que leem a tabela direto.
 
-### Server Exports
+---
 
-| Exportação | Parâmetros | Retorno | Descrição |
-|--------|------------|--------|-------------|
-| `CreatePlayerVehicle` | `request` | `integer? vehicleId, ErrorResult?` | Criar veículo |
-| `GetPlayerVehicle` | `vehicleId, filters?` | `PlayerVehicle?` | Obter veículo específico |
-| `GetPlayerVehicles` | `filters?` | `PlayerVehicle[]` | Obter veículos |
-| `SetPlayerVehicleOwner` | `vehicleId, citizenid` | `boolean, ErrorResult?` | Transferir propriedade |
-| `DeletePlayerVehicles` | `idType, idValue` | `boolean` | Excluir veículo(s) |
-| `GetVehicleIdByPlate` | `plate` | `integer?` | Encontrar ID por placa |
-| `SaveVehicle` | `vehicle, options` | `boolean, ErrorResult?` | Salvar estado |
-| `DoesPlayerVehiclePlateExist` | `plate` | `boolean` | Verificar se placa existe |
+## Estados do veículo
 
-### Estruturas de Dados
+A coluna `state` usa a enum interna:
 
-#### CreatePlayerVehicleRequest
+| Valor | Nome | Significado |
+|---|---|---|
+| `0` | `OUT` | Veículo fora da garagem, no mundo |
+| `1` | `GARAGED` | Guardado em uma garagem |
+| `2` | `IMPOUNDED` | Apreendido no depósito |
+
+`CreatePlayerVehicle` grava `GARAGED` quando a request traz `garage`, e `OUT` caso contrário.
+
+---
+
+## Entrypoints para outros recursos
+
+Todos os exports são de servidor.
+
+### GetPlayerVehicles
+
+Retorna a lista de veículos que batem com os filtros. Sem filtros, retorna todos.
+
 ```lua
----@class CreatePlayerVehicleRequest
----@field model string           # Nome do modelo
----@field citizenid? string      # ID do cidadao
----@field garage? string         # Nome da garagem
----@field props? table            # Propriedades ox_lib
+local vehicles = exports.qbx_vehicles:GetPlayerVehicles({
+    citizenid = 'ABC12345',   -- opcional
+    garage = 'pillboxgarage', -- opcional
+    states = 1                -- opcional: um estado ou um array de estados
+})
 ```
 
-#### PlayerVehicle
+Cada item da lista tem o formato:
+
 ```lua
----@class PlayerVehicle
----@field id number              # ID do banco de dados
----@field citizenid? string       # ID do cidadao
----@field modelName string       # Nome do modelo
----@field garage string          # Garagem atual
----@field state State            # Estado (0=OUT, 1=GARAGED, 2=IMPOUNDED)
----@field depotPrice integer     # Preço do depósito
----@field props table             # Propriedades ox_lib
+{
+    id = 12,                  -- vehicleId
+    citizenid = 'ABC12345',
+    modelName = 'sultan',
+    garage = 'pillboxgarage',
+    state = 1,
+    depotPrice = 0,
+    props = { ... }           -- tabela de props do ox_lib, já decodificada
+}
 ```
 
-#### PlayerVehiclesFilters
+Passar `states` como array (`{0, 2}`) monta um `OR` entre os estados.
+
+### GetPlayerVehicle
+
+Retorna um único veículo pelo `vehicleId`. Aceita os mesmos filtros como restrição adicional — útil para confirmar posse antes de agir.
+
 ```lua
----@class PlayerVehiclesFilters
----@field citizenid? string      # Filtrar por proprietário
----@field states? State|State[] # Filtrar por estado(s)
----@field garage? string         # Filtrar por garagem
+local vehicle = exports.qbx_vehicles:GetPlayerVehicle(vehicleId, { citizenid = 'ABC12345' })
 ```
 
-## Eventos
+Retorna `nil` se nenhum veículo bater com os filtros.
 
-| Evento | Payload | Descrição |
-|-------|----------|-------------|
-| `qbx_vehicles:server:vehicleSaved` | `vehicleId` | Veículo salvo |
-| `qbx_vehicles:server:vehicleCreated` | `vehicleId, citizenid` | Veículo criado |
-| `qbx_vehicles:server:ownerChanged` | `vehicleId, oldCitizenId, newCitizenId` | Propriedade alterada |
+### CreatePlayerVehicle
 
-## Sistema de Hooks
+Insere um veículo novo e devolve o `vehicleId`.
 
-O recurso suporta hooks via sistema do qbx_core:
-
-| Nome do Hook | Dados | Descrição |
-|-----------|------|-------------|
-| `createPlayerVehicle` | `{citizenid, garage, props}` | Antes da criação |
-| `changeVehicleOwner` | `{vehicleId, newCitizenId}` | Antes da alteração |
-| `saveVehicle` | `{vehicleId, options}` | Antes do salvamento |
-
-### Exemplo de Hook
 ```lua
--- Cancelar criação de veículo
-AddEventHandler('qbx_vehicles:hook:createPlayerVehicle', function(data)
-    if data.citizenid == 'BANNED123' then
-        CancelEvent()
+local vehicleId, err = exports.qbx_vehicles:CreatePlayerVehicle({
+    model = 'sultan',             -- obrigatório
+    citizenid = 'ABC12345',       -- opcional; sem ele o veículo fica sem dono
+    garage = 'pillboxgarage',     -- opcional; presente, define o state como GARAGED
+    props = { plate = 'ABC 123' } -- opcional
+})
+```
+
+Sem `props.plate`, uma placa aleatória é gerada e testada contra o banco até ser única. Os campos `engineHealth`, `bodyHealth` e `fuelLevel` recebem os padrões 1000, 1000 e 100 quando ausentes. `props.model` é sempre sobrescrito com o `joaat` do modelo.
+
+Se um hook `createPlayerVehicle` cancelar a operação, o retorno é `nil` mais um `ErrorResult` com `code = 'hook_cancelled'`.
+
+### SetPlayerVehicleOwner
+
+Troca o dono do veículo. A `license` é atualizada junto, derivada do novo `citizenid`.
+
+```lua
+local success, err = exports.qbx_vehicles:SetPlayerVehicleOwner(vehicleId, 'DEF67890')
+```
+
+Omitir o `citizenid` deixa o veículo sem dono. Cancelável pelo hook `changeVehicleOwner`.
+
+### DeletePlayerVehicles
+
+Apaga veículos por um dos quatro tipos de identificador.
+
+```lua
+exports.qbx_vehicles:DeletePlayerVehicles('vehicleId', 12)
+exports.qbx_vehicles:DeletePlayerVehicles('citizenid', 'ABC12345')
+exports.qbx_vehicles:DeletePlayerVehicles('license', 'license:abc...')
+exports.qbx_vehicles:DeletePlayerVehicles('plate', 'ABC 123')
+```
+
+Um `idType` fora desses quatro dispara `assert` e derruba a chamada. Usar `citizenid` ou `license` apaga **todos** os veículos do jogador.
+
+### SaveVehicle
+
+Persiste alterações de um veículo existente, a partir da entidade no mundo.
+
+```lua
+local success, err = exports.qbx_vehicles:SaveVehicle(vehicleEntity, {
+    garage = 'pillboxgarage',             -- opcional
+    state = 1,                            -- opcional
+    depotPrice = 500,                     -- opcional
+    props = lib.getVehicleProperties(veh) -- opcional
+})
+```
+
+O `vehicleId` é resolvido pelo statebag `Entity(vehicle).state.vehicleid` e, na falta dele, pela placa. Se o veículo não estiver na tabela, o retorno é `false` mais um `ErrorResult` com `code = 'not_owned'`.
+
+Ao passar `props`, as colunas espelho `plate`, `fuel`, `engine` e `body` são atualizadas junto com o `mods`.
+
+### GetVehicleIdByPlate
+
+```lua
+local vehicleId = exports.qbx_vehicles:GetVehicleIdByPlate('ABC 123')
+```
+
+A placa passa por `trim` antes da consulta. Retorna `nil` se não existir.
+
+### DoesPlayerVehiclePlateExist
+
+```lua
+local exists = exports.qbx_vehicles:DoesPlayerVehiclePlateExist('ABC 123')
+```
+
+---
+
+## Event hooks
+
+Duas operações passam pelo módulo de hooks do `qbx_core`. Um hook que retorne `false` cancela a operação, e o export devolve `code = 'hook_cancelled'`.
+
+### createPlayerVehicle
+
+Disparado antes do `INSERT`. Payload: `citizenid`, `garage`, `props`.
+
+```lua
+local registerHook = require '@qbx_core.modules.hooks'
+
+registerHook('createPlayerVehicle', function(payload)
+    -- payload.citizenid, payload.garage, payload.props
+    if payload.props.model == joaat('adder') then
+        return false -- bloqueia a criação
     end
 end)
 ```
 
-## Exemplos de Uso
+### changeVehicleOwner
 
-### Criando um Veículo
+Disparado antes do `UPDATE` de dono. Payload: `vehicleId`, `newCitizenId`.
+
 ```lua
-local vehicleId, err = exports.qbx_vehicles:CreatePlayerVehicle({
-    model = 'adder',
-    citizenid = 'CIT12345',
-    garage = 'pillbox_garage',
-    props = {
-        plate = 'ABC123',
-        fuelLevel = 100,
-        engineHealth = 1000,
-        bodyHealth = 1000
-    }
-})
-
-if vehicleId then
-    print('Veículo criado com ID:', vehicleId)
-else
-    print('Erro:', err.message)
-end
+registerHook('changeVehicleOwner', function(payload)
+    -- payload.vehicleId, payload.newCitizenId
+end)
 ```
 
-### Obtendo Veículos do Jogador
+---
+
+## Eventos emitidos
+
+### qbx_vehicles:server:vehicleSaved
+
+Disparado no servidor sempre que `SaveVehicle` completa com sucesso.
+
 ```lua
--- Todos os veículos
-local vehicles = exports.qbx_vehicles:GetPlayerVehicles({
-    citizenid = 'CIT12345'
-})
-
--- Apenas na garagem
-local garaged = exports.qbx_vehicles:GetPlayerVehicles({
-    citizenid = 'CIT12345',
-    states = 1 -- GARAGED
-})
-
--- Veículo específico
-local vehicle = exports.qbx_vehicles:GetPlayerVehicle(123)
+AddEventHandler('qbx_vehicles:server:vehicleSaved', function(vehicleId)
+    -- vehicleId salvo
+end)
 ```
 
-### Transferindo Propriedade
-```lua
-local success, err = exports.qbx_vehicles:SetPlayerVehicleOwner(123, 'CIT67890')
-if success then
-    print('Propriedade transferida!')
-end
-```
+---
 
-### Salvando Estado do Veículo
-```lua
-local vehicle = GetVehiclePedIsIn(ped, false)
-local success = exports.qbx_vehicles:SaveVehicle(vehicle, {
-    state = 1, -- GARAGED
-    garage = 'pillbox_garage',
-    props = lib.getVehicleProperties(vehicle)
-})
-```
-
-### Deletando Veículos
-```lua
--- Por citizenid
-exports.qbx_vehicles:DeletePlayerVehicles('citizenid', 'CIT12345')
-
--- Por placa
-exports.qbx_vehicles:DeletePlayerVehicles('plate', 'ABC123')
-
--- Por ID do veículo
-exports.qbx_vehicles:DeletePlayerVehicles('id', 123)
-```
-
-## Estrutura de Arquivos
+## Estrutura de arquivos
 
 ```
 qbx_vehicles/
 ├── server/
-│   ├── main.lua           # API principal, CRUD, exports
-│   └── storage.lua         # Consultas de banco de dados
-└── fxmanifest.lua
+│   └── main.lua          — exports de CRUD, event hooks e evento vehicleSaved
+├── vehicles.sql          — schema da tabela player_vehicles
+└── fxmanifest.lua        — declara o recurso como server_only
 ```
-
-## Dependências
-
-| Dependência | Versão Mínima | Obrigatório |
-|------------|-------------------|----------|
-| ox_lib | - | ✅ |
-| oxmysql | - | ✅ |
-| qbx_core | 1.2.0 | ✅ |
-
-## Notas Importantes
-
-- Este é um recurso **apenas do servidor** (sem scripts do cliente)
-- Placas são geradas automaticamente se não fornecidas
-- Placas são garantidamente exclusivas antes da atribuição
-- Todas as alterações de estado devem passar pela API para consistência
-- O recurso integra com `qbx_core` para validação do jogador
-- A tabela do banco de dados é criada automaticamente na inicialização
-
-## Solução de Problemas
-
-### Veículo não é criado
-- Verifique se o citizenid existe
-- Confirme que o modelo do veículo é válido
-- Verifique se a placa não está duplicada
-- Veja erros retornados na variável `err`
-
-### Veículo não salva
-- Confirme que o veículo tem um ID válido
-- Verifique se as propriedades estão no formato ox_lib
-- Confirme que o veículo está em um estado válido
-
-### Transferência falha
-- Verifique se o novo citizenid existe
-- Confirme que o vehicleId é válido
-- Verifique se o veículo não está apreendido (se houver restrição)
-
-### Placa duplicada
-- O sistema valida automaticamente antes de atribuir
-- Se ocorrer, verifique a função `DoesPlayerVehiclePlateExist`
-- Gere uma nova placa manualmente se necessário
