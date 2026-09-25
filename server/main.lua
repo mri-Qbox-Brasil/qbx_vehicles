@@ -14,11 +14,21 @@ local State = {
 
 local triggerEventHooks = require '@qbx_core.modules.hooks'
 
+---@param plate any
+---@return any
+local function trimPlate(plate)
+    if type(plate) ~= 'string' then return plate end
+    return qbx.string.trim(plate)
+end
+
 ---Returns true if the given plate exists
 ---@param plate string
 ---@return boolean
 local function doesEntityPlateExist(plate)
-    local result = MySQL.scalar.await('SELECT 1 FROM player_vehicles WHERE plate = ? LIMIT 1', {plate})
+    if type(plate) ~= 'string' then return false end
+    local result = MySQL.scalar.await('SELECT 1 FROM player_vehicles WHERE plate = ? LIMIT 1', {
+        trimPlate(plate)
+    })
     return result ~= nil
 end
 
@@ -138,9 +148,11 @@ local function createPlayerVehicle(request)
     assert(request.model ~= nil, 'missing required field: model')
 
     local props = request.props or {}
-    if not props.plate then
+    if props.plate then
+        props.plate = trimPlate(props.plate)
+    else
         repeat
-            props.plate = qbx.generateRandomPlate()
+            props.plate = trimPlate(qbx.generateRandomPlate())
         until doesEntityPlateExist(props.plate) == false
     end
     props.engineHealth = props.engineHealth or 1000
@@ -244,6 +256,9 @@ local function buildSaveVehicleQuery(vehicleId, options)
     end
 
     if options.props then
+        if options.props.plate then
+            options.props.plate = trimPlate(options.props.plate)
+        end
         crumbs[#crumbs+1] = 'mods = ?'
         placeholders[#placeholders+1] = json.encode(options.props)
 
